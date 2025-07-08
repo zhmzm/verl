@@ -38,6 +38,6 @@ python3 -m verl.trainer.main_ppo \
     trainer.nnodes=1 \
     trainer.save_freq=20 \
     trainer.test_freq=5 \
-    actor_rollout_ref.rollout.temperature= 0.8\
+    actor_rollout_ref.rollout.temperature=0.8 \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
     trainer.total_epochs=15 $@

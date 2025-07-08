@@ -54,7 +54,7 @@ if __name__ == "__main__":
             question += " " + instruction_following
 
             answer = example.pop("answer") if is_math500 else example.pop("solution")
-            solution = extract_solution(answer)
+            solution = answer if is_math500 else extract_solution(answer) 
 
             return {
                 "data_source": test_data_source if is_math500 else train_data_source,

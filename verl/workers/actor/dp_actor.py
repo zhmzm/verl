@@ -35,7 +35,7 @@ from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 from verl.utils.torch_functional import logprobs_from_logits
-from verl.utils.ulysses import gather_outpus_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
+from verl.utils.ulysses import gather_outpus_and_unpad, ulysses_pad_and_slice_inputs
 from verl.workers.actor import BasePPOActor
 
 if is_cuda_available:
@@ -58,11 +58,9 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_optimizer = actor_optimizer
 
         self.use_remove_padding = self.config.get("use_remove_padding", False)
-        if torch.distributed.get_rank() == 0:
-            print(f"Actor use_remove_padding={self.use_remove_padding}")
+        print(f"Actor use_remove_padding={self.use_remove_padding}")
         self.use_fused_kernels = self.config.get("use_fused_kernels", False)
-        if torch.distributed.get_rank() == 0:
-            print(f"Actor use_fused_kernels={self.use_fused_kernels}")
+        print(f"Actor use_fused_kernels={self.use_fused_kernels}")
 
         self.ulysses_sequence_parallel_size = self.config.ulysses_sequence_parallel_size
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
@@ -80,9 +78,10 @@ class DataParallelPPOActor(BasePPOActor):
             entropy: # (bs, response_len)
             log_probs: # (bs, response_len)
         """
+
         response_length = micro_batch["responses"].size(-1)
         multi_modal_inputs = {}
-        if "multi_modal_inputs" in micro_batch.keys():
+        if "multi_modal_inputs" in micro_batch:
             for key in micro_batch["multi_modal_inputs"][0].keys():
                 multi_modal_inputs[key] = torch.cat([inputs[key] for inputs in micro_batch["multi_modal_inputs"]], dim=0)
 
@@ -94,7 +93,8 @@ class DataParallelPPOActor(BasePPOActor):
             entropy = None
             if position_ids.dim() == 3:  # qwen2vl mrope
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 3, seqlen) -> (3, bsz, seqlen)
-
+            #(WorkerDict pid=2707683) self.use_remove_padding True [repeated 32x across cluster]
+            #(WorkerDict pid=2707908) self.use_fused_kernels:  False [repeated 32x across cluster]
             if self.use_remove_padding:
                 input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1), attention_mask)  # input_ids_rmpad (total_nnz, ...)
                 input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
@@ -110,20 +110,11 @@ class DataParallelPPOActor(BasePPOActor):
 
                 # pad and slice the inputs if sp > 1
                 if self.use_ulysses_sp:
-                    is_vlm_model = "multi_modal_inputs" in micro_batch
-                    if is_vlm_model:
-                        # vlm model's inputs will be sliced after embedding
-                        input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad(
-                            input_ids_rmpad,
-                            position_ids_rmpad=position_ids_rmpad,
-                            sp_size=self.ulysses_sequence_parallel_size,
-                        )
-                    else:
-                        input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad_and_slice_inputs(
-                            input_ids_rmpad,
-                            position_ids_rmpad=position_ids_rmpad,
-                            sp_size=self.ulysses_sequence_parallel_size,
-                        )
+                    input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad_and_slice_inputs(
+                        input_ids_rmpad,
+                        position_ids_rmpad=position_ids_rmpad,
+                        sp_size=self.ulysses_sequence_parallel_size,
+                    )
                     input_ids_rmpad_rolled, _, _ = ulysses_pad_and_slice_inputs(
                         input_ids_rmpad_rolled,
                         position_ids_rmpad=None,
@@ -146,13 +137,52 @@ class DataParallelPPOActor(BasePPOActor):
                     **extra_args,
                 )  # prevent model thinks we are generating
 
+
                 if self.use_fused_kernels:
+                    print('using self.use_fused_kernels; token level temperature fails!!!!!!!!!')
                     log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
                     entropy_rmpad = output.entropy.squeeze(0)  # (total_nnz,)
 
                 else:
                     logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
-                    logits_rmpad.div_(temperature)
+                    #logits_rmpad.div_(temperature)
+
+                    bs, seqlen = input_ids.shape                     # e.g. (8, 3072)
+                    resp_len = micro_batch["responses"].size(-1)     # e.g. 2048
+
+                    # ---------------- 构造完整温度张量 ----------------
+                    token_temperature_full = torch.full(
+                        (bs, seqlen),          # 形状
+                        fill_value=temperature,  # 要填入的值
+                        dtype=logits_rmpad.dtype,
+                        device=logits_rmpad.device,
+                    )
+                    token_temperature_full[:, -resp_len:] = micro_batch["token_temperature"].to(logits_rmpad.dtype)
+
+                    # --------------- 压平并对齐到 rmpad 顺序 ---------------
+                    token_temperature_rmpad = index_first_axis(
+                        rearrange(token_temperature_full.unsqueeze(-1), "b s 1 -> (b s) 1"),
+                        indices
+                    ).squeeze(-1)                                   # (total_nnz,)
+
+                    # --------------- 逐 token 调温 ---------------
+                    token_temperature_rmpad.clamp_(min=1e-4)
+                    logits_rmpad.div_(token_temperature_rmpad.unsqueeze(-1))
+
+                    # ---------------- 调试打印 (仅一次) ----------------
+                    # if True:
+                    #     print("\n====== Token-level Temperature Debug ======")
+                    #     print("input_ids.shape               :", input_ids.shape)              # (bs, seqlen)
+                    #     print("responses.shape               :", micro_batch['responses'].shape)  # (bs, resp_len)
+                    #     print("token_temperature_full.shape  :", token_temperature_full.shape) # (bs, seqlen)
+                    #     print("token_temperature_rmpad.shape :", token_temperature_rmpad.shape) # (total_nnz,)
+                    #     print("logits_rmpad.shape            :", logits_rmpad.shape)           # (total_nnz, vocab)
+                    #     print("indices range                 : 0 …", int(indices.max()), "(seqlen-1 =", seqlen-1, ")")
+                    #     print("sample T prompt - first token :", float(token_temperature_full[0, 0]))
+                    #     print("sample T response - last token:", float(token_temperature_full[0, -1]))
+                    #     print("sample logits after  div      :", logits_rmpad[0, :5].float().cpu())
+                    #     print("==========================================\n")
+
 
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                     inplace_backward = True
@@ -205,6 +235,7 @@ class DataParallelPPOActor(BasePPOActor):
                 log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
 
             else:  # not using rmpad and no ulysses sp
+                print('Token level temperature fails for self.use_remove_padding is False!!!!!!!')
                 extra_args = {}
                 if self.use_fused_kernels:
                     extra_args["temperature"] = temperature
@@ -269,14 +300,12 @@ class DataParallelPPOActor(BasePPOActor):
         Returns:
             torch.Tensor: the log_prob tensor
         """
-        # set to eval
-        self.actor_module.eval()
-
+        # set to eval        
         micro_batch_size = data.meta_info["micro_batch_size"]
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
 
-        select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
+        select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "token_temperature"]
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
@@ -322,7 +351,7 @@ class DataParallelPPOActor(BasePPOActor):
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         multi_turn = data.meta_info.get("multi_turn", False)
 
-        select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
+        select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages", "token_temperature"]
         if multi_turn:
             select_keys.append("loss_mask")
         if self.config.use_kl_loss:

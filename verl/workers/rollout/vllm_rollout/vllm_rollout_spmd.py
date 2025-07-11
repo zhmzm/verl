@@ -39,7 +39,6 @@ from omegaconf import DictConfig, OmegaConf
 from tensordict import TensorDict
 from vllm import LLM, SamplingParams
 from vllm.distributed import parallel_state as vllm_ps
-from vllm.lora.request import LoRARequest
 from vllm.worker.worker_base import WorkerWrapperBase
 
 from verl import DataProto
@@ -116,8 +115,6 @@ class vLLMRollout(BaseRollout):
                 max_position_embeddings = model_hf_config.max_position_embeddings
             elif hasattr(model_hf_config, "llm_config") and hasattr(model_hf_config.llm_config, "max_position_embeddings"):
                 max_position_embeddings = model_hf_config.llm_config.max_position_embeddings
-            elif hasattr(model_hf_config, "text_config") and hasattr(model_hf_config.text_config, "max_position_embeddings"):
-                max_position_embeddings = model_hf_config.text_config.max_position_embeddings
             if max_position_embeddings is None:
                 raise ValueError("max_position_embeddings not found in model_hf_config")
 
@@ -138,8 +135,6 @@ class vLLMRollout(BaseRollout):
         if config.get("limit_images", None):  # support for multi-image data
             limit_mm_per_prompt = {"image": config.get("limit_images")}
 
-        lora_kwargs = kwargs.pop('lora_kwargs', {})
-        self.lora_kwargs = lora_kwargs
         # copy it to avoid secretly modifying the engine config
         engine_kwargs = {} if "engine_kwargs" not in config or "vllm" not in config.engine_kwargs else OmegaConf.to_container(deepcopy(config.engine_kwargs.vllm))
         # For each vLLM engine parameter,
@@ -167,7 +162,6 @@ class vLLMRollout(BaseRollout):
             enable_prefix_caching=True,
             trust_remote_code=trust_remote_code,
             seed=config.get("seed", 0),
-            **lora_kwargs,
             **engine_kwargs,
         )
 
@@ -210,7 +204,379 @@ class vLLMRollout(BaseRollout):
         for key, value in old_sampling_params_args.items():
             setattr(self.sampling_params, key, value)
 
+    # @GPUMemoryLogger(role="vllm rollout spmd", logger=logger)
+    # @torch.no_grad()
+    # def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
+    #     """Roll out a batch of prompts.
+
+    #     * 验证阶段 (`is_validate=True`)：单温度、单样本，与原实现一致。
+    #     * 训练 / 推理阶段：对同一 prompt 依次采样 `n` 条，温度按
+    #       `base_T ±0.1 ±0.2 …` 对称展开（`n≤5` 时即 `T,−0.1,+0.1,−0.2,+0.2`）。
+    #     * 返回张量形状、字段名与旧实现完全一致。
+    #     """
+    #     # ------------------------------------------------------------------
+    #     # 0. 可选：重建 vLLM cache engine（老版本需要）
+    #     # ------------------------------------------------------------------
+    #     if (
+    #         vllm_version in ("0.5.4", "0.6.3")
+    #         and self.config.free_cache_engine
+    #     ):
+    #         self.inference_engine.init_cache_engine()
+
+    #     # ------------------------------------------------------------------
+    #     # 1. 解析 prompt 侧张量 & metadata
+    #     # ------------------------------------------------------------------
+    #     idx            = prompts.batch["input_ids"]       # (bs, prompt_len)
+    #     attention_mask = prompts.batch["attention_mask"]  # left‑padded
+    #     position_ids   = prompts.batch["position_ids"]
+    #     eos_token_id   = prompts.meta_info["eos_token_id"]
+    #     bs             = idx.size(0)
+
+    #     # ------------------- non‑tensor batch，转 raw ids 给 vLLM ----------
+    #     ntb = prompts.non_tensor_batch
+    #     if "raw_prompt_ids" not in ntb:
+    #         ntb["raw_prompt_ids"] = np.array(
+    #             [_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(bs)],
+    #             dtype=object,
+    #         )
+    #     if bs != len(ntb["raw_prompt_ids"]):
+    #         raise RuntimeError("vllm sharding manager is not work properly.")
+
+    #     if "multi_modal_data" in ntb:
+    #         vllm_inputs = [
+    #             {"prompt_token_ids": p_ids.tolist() if isinstance(p_ids, np.ndarray) else p_ids,
+    #              "multi_modal_data" : mmd}
+    #             for p_ids, mmd in zip(ntb.pop("raw_prompt_ids"), ntb.pop("multi_modal_data"))
+    #         ]
+    #     else:
+    #         vllm_inputs = [
+    #             {"prompt_token_ids": p_ids.tolist() if isinstance(p_ids, np.ndarray) else p_ids}
+    #             for p_ids in ntb.pop("raw_prompt_ids")
+    #         ]
+
+    #     # ------------------------------------------------------------------
+    #     # 2. 选择分支（do_sample / validate / greedy）并拿到 token‑id 列表
+    #     # ------------------------------------------------------------------
+    #     do_sample   = prompts.meta_info.get("do_sample", True)
+    #     is_validate = prompts.meta_info.get("validate", False)
+
+    #     outputs_token_ids: list[list[int]] = []  # 最终收集到这里
+
+    #     # ------ (A) Greedy ⇒ temperature=0, n=1 ---------------------------
+    #     if not do_sample:
+    #         greedy_kw = {
+    #             "best_of"    : 1,
+    #             "top_p"      : 1.0,
+    #             "top_k"      : -1,
+    #             "min_p"      : 0.0,
+    #             "temperature": 0.0,
+    #             "n"          : 1,
+    #         }
+    #         with self.update_sampling_params(**greedy_kw):
+    #             outs = self.inference_engine.generate(vllm_inputs, self.sampling_params, use_tqdm=False)
+    #         for o in outs:
+    #             outputs_token_ids.append(o.outputs[0].token_ids)
+
+    #     # ------ (B) Validation ⇒ 使用 config.val_kwargs，n=1 --------------
+    #     elif is_validate:
+    #         val_kw = {
+    #             "top_k"      : self.config.val_kwargs.top_k,
+    #             "top_p"      : self.config.val_kwargs.top_p,
+    #             "temperature": self.config.val_kwargs.temperature,
+    #             "n"          : 1,
+    #         }
+    #         with self.update_sampling_params(**val_kw):
+    #             outs = self.inference_engine.generate(vllm_inputs, self.sampling_params, use_tqdm=False)
+    #         for o in outs:
+    #             outputs_token_ids.append(o.outputs[0].token_ids)
+
+    #     # ------ (C) Training / Sampling ⇒ 多温度，多次调用 ---------------
+    #     else:
+    #         orig_n = self.sampling_params.n           # 目标采样条数
+    #         base_T = kwargs.get("temperature", self.sampling_params.temperature)
+
+    #         # 构造对称偏移序列：0, −0.1, +0.1, −0.2, +0.2, −0.3 …
+    #         deltas, step = [0.0, -0.1, 0.1, -0.2, 0.2], 0.3
+    #         while len(deltas) < orig_n:
+    #             deltas.extend([-step, step])
+    #             step += 0.1
+    #         temp_list = [max(0.0, base_T + d) for d in deltas[:orig_n]]
+
+    #         for T in temp_list:
+    #             per_kw = {"temperature": T, "n": 1}
+    #             with self.update_sampling_params(**per_kw):
+    #                 outs = self.inference_engine.generate(vllm_inputs, self.sampling_params, use_tqdm=False)
+    #             for o in outs:
+    #                 outputs_token_ids.append(o.outputs[0].token_ids)
+
+    #         # 现在 outputs_token_ids 顺序为：prompt0_T0, prompt1_T0 … prompt{bs-1}_T0, prompt0_T1 …
+    #         # 需要转成 prompt 主序 + temp 次序
+    #         reordered = []
+    #         for i in range(bs):
+    #             for j in range(orig_n):
+    #                 reordered.append(outputs_token_ids[j*bs + i])
+    #         outputs_token_ids = reordered
+
+    #     # ------------------------------------------------------------------
+    #     # 3. pad → torch.Tensor & repeat prompt‑side张量（当 n>1）
+    #     # ------------------------------------------------------------------
+    #     response = pad_2d_list_to_length(
+    #         outputs_token_ids,
+    #         self.pad_token_id,
+    #         max_length=self.config.response_length,
+    #     ).to(idx.device)                                   # (bs*n, resp_len)
+
+    #     effective_n = response.size(0) // bs
+    #     if effective_n > 1:
+    #         idx            = _repeat_interleave(idx,            effective_n)
+    #         attention_mask = _repeat_interleave(attention_mask, effective_n)
+    #         position_ids   = _repeat_interleave(position_ids,   effective_n)
+    #         if "multi_modal_inputs" in ntb:
+    #             ntb["multi_modal_inputs"] = _repeat_interleave(ntb["multi_modal_inputs"], effective_n)
+    #         if "tools_kwargs" in ntb:
+    #             ntb["tools_kwargs"] = _repeat_interleave(ntb["tools_kwargs"], effective_n)
+    #         bs *= effective_n
+
+    #     seq = torch.cat([idx, response], dim=-1)
+
+    #     # --------------------- position_ids / attention_mask --------------
+    #     resp_len = response.size(1)
+    #     delta_pid = torch.arange(1, resp_len + 1, device=position_ids.device)
+    #     delta_pid = delta_pid.unsqueeze(0).expand(bs, -1)
+    #     if position_ids.dim() == 3:  # qwen2vl mrope
+    #         delta_pid = delta_pid.view(bs, 1, -1).expand(bs, 3, -1)
+    #     pos_resp = position_ids[..., -1:] + delta_pid
+    #     position_ids = torch.cat([position_ids, pos_resp], dim=-1)
+
+    #     resp_mask = get_response_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
+    #     attention_mask = torch.cat((attention_mask, resp_mask), dim=-1)
+
+    #     # ------------------------------------------------------------------
+    #     # 4. 打包返回
+    #     # ------------------------------------------------------------------
+    #     batch = TensorDict(
+    #         {
+    #             "prompts"      : idx,
+    #             "responses"    : response,
+    #             "input_ids"    : seq,
+    #             "attention_mask": attention_mask,
+    #             "position_ids" : position_ids,
+    #         },
+    #         batch_size=bs,
+    #     )
+
+    #     # optional: free cache engine
+    #     if (
+    #         vllm_version in ("0.5.4", "0.6.3")
+    #         and self.config.free_cache_engine
+    #     ):
+    #         self.inference_engine.free_cache_engine()
+
+    #     return DataProto(batch=batch, non_tensor_batch=ntb)
+
+
     @GPUMemoryLogger(role="vllm rollout spmd", logger=logger)
+    @torch.no_grad()
+    def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
+        """Roll out a batch of prompts.
+
+        * 验证阶段 (`is_validate=True`)：单温度、单样本，与原实现一致。
+        * 训练 / 推理阶段：对同一 prompt 依次采样 `n` 条，温度按
+          `base_T ±0.1 ±0.2 …` 对称展开（`n≤5` 时即 `T,−0.1,+0.1,−0.2,+0.2`）。
+        * 返回张量形状、字段名与旧实现完全一致。
+        """
+        # ------------------------------------------------------------------
+        # 0. 可选：重建 vLLM cache engine（老版本需要）
+        # ------------------------------------------------------------------
+        if (
+            vllm_version in ("0.5.4", "0.6.3")
+            and self.config.free_cache_engine
+        ):
+            self.inference_engine.init_cache_engine()
+
+        # ------------------------------------------------------------------
+        # 1. 解析 prompt 侧张量 & metadata
+        # ------------------------------------------------------------------
+        idx            = prompts.batch["input_ids"]       # (bs, prompt_len)
+        attention_mask = prompts.batch["attention_mask"]  # left‑padded
+        position_ids   = prompts.batch["position_ids"]
+        eos_token_id   = prompts.meta_info["eos_token_id"]
+        bs             = idx.size(0)
+
+        # ------------------- non‑tensor batch，转 raw ids 给 vLLM ----------
+        ntb = prompts.non_tensor_batch
+        if "raw_prompt_ids" not in ntb:
+            ntb["raw_prompt_ids"] = np.array(
+                [_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(bs)],
+                dtype=object,
+            )
+        if bs != len(ntb["raw_prompt_ids"]):
+            raise RuntimeError("vllm sharding manager is not work properly.")
+
+        if "multi_modal_data" in ntb:
+            vllm_inputs = [
+                {"prompt_token_ids": p_ids.tolist() if isinstance(p_ids, np.ndarray) else p_ids,
+                 "multi_modal_data" : mmd}
+                for p_ids, mmd in zip(ntb.pop("raw_prompt_ids"), ntb.pop("multi_modal_data"))
+            ]
+        else:
+            vllm_inputs = [
+                {"prompt_token_ids": p_ids.tolist() if isinstance(p_ids, np.ndarray) else p_ids}
+                for p_ids in ntb.pop("raw_prompt_ids")
+            ]
+
+        # ------------------------------------------------------------------
+        # 2. 选择分支（do_sample / validate / greedy）并拿到 token‑id 列表
+        # ------------------------------------------------------------------
+        do_sample   = prompts.meta_info.get("do_sample", True)
+        is_validate = prompts.meta_info.get("validate", False)
+
+        outputs_token_ids: list[list[int]] = []  # 最终收集到这里
+        temps_used: list[float] = []
+
+        # ------ (A) Greedy ⇒ temperature=0, n=1 ---------------------------
+        if not do_sample:
+            greedy_kw = {
+                "best_of"    : 1,
+                "top_p"      : 1.0,
+                "top_k"      : -1,
+                "min_p"      : 0.0,
+                "temperature": 0.0,
+                "n"          : 1,
+            }
+            with self.update_sampling_params(**greedy_kw):
+                outs = self.inference_engine.generate(vllm_inputs, self.sampling_params, use_tqdm=False)
+            for o in outs:
+                outputs_token_ids.append(o.outputs[0].token_ids)
+
+        # ------ (B) Validation ⇒ 使用 config.val_kwargs，n=1 --------------
+        elif is_validate:
+            val_kw = {
+                "top_k"      : self.config.val_kwargs.top_k,
+                "top_p"      : self.config.val_kwargs.top_p,
+                "temperature": self.config.val_kwargs.temperature,
+                "n"          : 1,
+            }
+            with self.update_sampling_params(**val_kw):
+                outs = self.inference_engine.generate(vllm_inputs, self.sampling_params, use_tqdm=False)
+            for o in outs:
+                outputs_token_ids.append(o.outputs[0].token_ids)
+                temps_used.append(val_kw["temperature"])   # ← 记录温度
+
+        # ------ (C) Training / Sampling ⇒ 多温度，多次调用 ---------------
+        else:
+            orig_n = self.sampling_params.n           # 目标采样条数
+            base_T = kwargs.get("temperature", self.sampling_params.temperature)
+
+            # 构造对称偏移序列：0, −0.1, +0.1, −0.2, +0.2, −0.3 …
+            deltas, step = [0.0, -0.1, 0.1, -0.2, 0.2], 0.3
+            while len(deltas) < orig_n:
+                deltas.extend([-step, step])
+                step += 0.1
+            temp_list = [max(0.0, base_T + d) for d in deltas[:orig_n]]
+
+            for T in temp_list:
+                per_kw = {"temperature": T, "n": 1, "logprobs": 1}
+                with self.update_sampling_params(**per_kw):
+                    outs = self.inference_engine.generate(vllm_inputs, self.sampling_params, use_tqdm=False)
+                for output in outs:                       # 一条 prompt 的结果
+                    for sample in output.outputs:         # n 条 sample；你的例子里 n==1
+                        # 1) token_ids
+                        outputs_token_ids.append(sample.token_ids)
+                        # 2) 温度序列 —— 存在 sentinel token_id == -1 的那一列
+                        step_dicts = getattr(sample, "top_logprobs", None)
+                        if step_dicts is None:            # vLLM ≥0.6 改名为 token_logprobs
+                            step_dicts = sample.logprobs
+                        temps = []
+                        for step in step_dicts:           # step 是 dict{token_id: Logprob}
+                            sent = step.get(-1)           # 我们写入的温度列
+                            temps.append(float(sent.logprob) if sent else None)
+
+                        temps_used.append(temps)     
+
+            unique_temps_no_none = set(t for seq in temps_used for t in seq if t is not None)
+            print(f"不同温度（不含 None）数: {len(unique_temps_no_none)}")
+            print("所有不同温度（不含 None）:", unique_temps_no_none)             
+
+            # 现在 outputs_token_ids 顺序为：prompt0_T0, prompt1_T0 … prompt{bs-1}_T0, prompt0_T1 …
+            # 需要转成 prompt 主序 + temp 次序
+            reordered, reordered_tmp = [], []
+            for i in range(bs):
+                for j in range(orig_n):
+                    reordered.append(outputs_token_ids[j*bs + i])
+                    reordered_tmp.append(temps_used       [j*bs + i])
+            outputs_token_ids = reordered
+            temps_used        = reordered_tmp
+
+
+        # ------------------------------------------------------------------
+        # 3. pad → torch.Tensor & repeat prompt‑side张量（当 n>1）
+        # ------------------------------------------------------------------
+        response = pad_2d_list_to_length(
+            outputs_token_ids,
+            self.pad_token_id,
+            max_length=self.config.response_length,
+        ).to(idx.device)                                   # (bs*n, resp_len)
+
+        token_level_temperature = pad_2d_list_to_length(
+            temps_used,
+            -1.0,                           # sentinel
+            max_length=self.config.response_length,
+        ).to(idx.device)                            # (bs*effective_n, resp_len)
+
+        effective_n = response.size(0) // bs
+        if effective_n > 1:
+            idx            = _repeat_interleave(idx,            effective_n)
+            attention_mask = _repeat_interleave(attention_mask, effective_n)
+            position_ids   = _repeat_interleave(position_ids,   effective_n)
+            if "multi_modal_inputs" in ntb:
+                ntb["multi_modal_inputs"] = _repeat_interleave(ntb["multi_modal_inputs"], effective_n)
+            if "tools_kwargs" in ntb:
+                ntb["tools_kwargs"] = _repeat_interleave(ntb["tools_kwargs"], effective_n)
+            bs *= effective_n
+
+        seq = torch.cat([idx, response], dim=-1)
+
+        # --------------------- position_ids / attention_mask --------------
+        resp_len = response.size(1)
+        delta_pid = torch.arange(1, resp_len + 1, device=position_ids.device)
+        delta_pid = delta_pid.unsqueeze(0).expand(bs, -1)
+        if position_ids.dim() == 3:  # qwen2vl mrope
+            delta_pid = delta_pid.view(bs, 1, -1).expand(bs, 3, -1)
+        pos_resp = position_ids[..., -1:] + delta_pid
+        position_ids = torch.cat([position_ids, pos_resp], dim=-1)
+
+        resp_mask = get_response_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
+        attention_mask = torch.cat((attention_mask, resp_mask), dim=-1)
+
+        # ------------------------------------------------------------------
+        # 4. 打包返回
+        # ------------------------------------------------------------------
+        batch = TensorDict(
+            {
+                "prompts"      : idx,
+                "responses"    : response,
+                "input_ids"    : seq,
+                "attention_mask": attention_mask,
+                "position_ids" : position_ids,
+                "token_temperature": token_level_temperature
+            },
+            batch_size=bs,
+        )
+        
+
+        # optional: free cache engine
+        if (
+            vllm_version in ("0.5.4", "0.6.3")
+            and self.config.free_cache_engine
+        ):
+            self.inference_engine.free_cache_engine()
+
+        return DataProto(batch=batch, non_tensor_batch=ntb)
+
+
+
+    '''@GPUMemoryLogger(role="vllm rollout spmd", logger=logger)
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
         # rebuild vllm cache engine
@@ -276,19 +642,12 @@ class vLLMRollout(BaseRollout):
                 "n": 1,  # if validate, already repeat in ray_trainer
             }
 
-        lora_requests = None
-        if self.lora_kwargs:
-            lora_int_ids = list(self.inference_engine.llm_engine.list_loras())
-            if len(lora_int_ids) > 0:
-                lora_int_id=lora_int_ids[0]
-                lora_requests = [LoRARequest(lora_name=f"{lora_int_id}",lora_int_id=lora_int_id,lora_path="/simon-stub-path")] * batch_size
-
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
+            print('spmd rollout')
             outputs = self.inference_engine.generate(
                 prompts=vllm_inputs,  # because we have already convert it to prompt token id
                 sampling_params=self.sampling_params,
-                lora_request=lora_requests,
                 use_tqdm=False,
             )
 
@@ -296,25 +655,19 @@ class vLLMRollout(BaseRollout):
             # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
 
             response = []
-            rollout_log_probs = []
             for output in outputs:
                 for sample_id in range(len(output.outputs)):
-                    response_ids = output.outputs[sample_id].token_ids
-                    response.append(response_ids)
-                    curr_log_prob = []
-                    for i, logprob in enumerate(output.outputs[sample_id].logprobs):
-                        curr_log_prob.append(logprob[response_ids[i]].logprob)
-                    rollout_log_probs.append(curr_log_prob)
+                    response.append(output.outputs[sample_id].token_ids)
 
             response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(idx.device)
-            rollout_log_probs = pad_2d_list_to_length(rollout_log_probs, -1, max_length=self.config.response_length).to(idx.device)
-            rollout_log_probs = rollout_log_probs.to(torch.float32)
 
             if self.sampling_params.n > 1 and do_sample:
                 idx = _repeat_interleave(idx, self.sampling_params.n)
                 attention_mask = _repeat_interleave(attention_mask, self.sampling_params.n)
                 position_ids = _repeat_interleave(position_ids, self.sampling_params.n)
                 batch_size = batch_size * self.sampling_params.n
+                if "multi_modal_inputs" in non_tensor_batch.keys():
+                    non_tensor_batch["multi_modal_inputs"] = _repeat_interleave(non_tensor_batch["multi_modal_inputs"], self.sampling_params.n)
                 # NOTE(linjunrong): for multi-turn https://github.com/volcengine/verl/pull/1037
                 if "tools_kwargs" in non_tensor_batch.keys():
                     non_tensor_batch["tools_kwargs"] = _repeat_interleave(non_tensor_batch["tools_kwargs"], self.sampling_params.n)
@@ -342,7 +695,7 @@ class vLLMRollout(BaseRollout):
                 "prompts": idx,
                 "responses": response,
                 "input_ids": seq,  # here input_ids become the whole sentences
-                'rollout_log_probs': rollout_log_probs, # we will recompute old log prob with actor
+                # 'old_log_probs': log_probs, # we will recompute old log prob with actor
                 "attention_mask": attention_mask,
                 "position_ids": position_ids,
             },
@@ -360,7 +713,7 @@ class vLLMRollout(BaseRollout):
         ):
             self.inference_engine.free_cache_engine()
 
-        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
+        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)'''
 
 
 class vLLMAsyncRollout:
@@ -386,7 +739,7 @@ class vLLMAsyncRollout:
     def load_model(self, *args, **kwargs):
         self.inference_engine.load_model(*args, **kwargs)
 
-        # inference engine is initialized now, update sharding manager
+        # inference engine is intialized now, update sharding manager
         self.sharding_manager.inference_engine = self.inference_engine
         self.sharding_manager.model_runner = self.inference_engine.worker.model_runner
 

@@ -31,17 +31,17 @@ train_prompt_mini_bsz=64
 n_resp_per_prompt=8
 
 # Ray
-RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
+RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8625"}
 WORKING_DIR=${WORKING_DIR:-"${PWD}"}
 RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
 NNODES=${NNODES:-2}
 # Paths
-MODEL_DIR=/opt/tiger/Nemotron-Research-Reasoning-Qwen-1.5B
-DATA_DIR=/opt/tiger/dapo_data
-
+MODEL_DIR=nvidia/Nemotron-Research-Reasoning-Qwen-1.5B
+DATA_DIR=/opt/tiger/verl/data/dapo-box/
+SAVE_DIR=/mnt/bn/llm-liufangxu/mlx/users/haomin/verl/save
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${DATA_DIR}"}
 MODEL_PATH=${MODEL_PATH:-"${MODEL_DIR}"}
-CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
+CKPTS_DIR=${CKPTS_DIR:-"${SAVE_DIR}/ckpts/${project_name}/${exp_name}"}
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/dapo-math-17k-box.parquet"}
 TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/aime-2024-box.parquet"}
 

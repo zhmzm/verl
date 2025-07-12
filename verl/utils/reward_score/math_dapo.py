@@ -16,24 +16,76 @@
 import re
 from typing import Optional
 
+### consistance reward
+import unicodedata
+from typing import Dict
+# ====== 你给出的特殊符号 ======
+special_chars = (
+    "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
+    "¡¢£¤¥¦§¨©ª«¬­®¯°±²³´µ¶·¸¹º»¼½¾¿"
+    "×÷⁂⁃⁇⁈⁉‰‱′″‴‵‶‷‸‹›‼‽⁄₠₡₢₣₤₥₦₧₨₩₪₫€₭₮₯₰"
+    "†‡•‣※→←↑↓↔↕↖↗↘↙⇄⇆⇌⇔⇒⇐⇑⇓⇕⇛⇝⟰⟱"
+    "∂∆∇∈∉∋∌∏∑−∓∔∕∗∘∙√∛∜∝∞∟∠∡∢∣∤∥∦∧∨∩∪"
+    "∫∬∭∮∯∰∱∲∳∴∵∶∷∸∹∺∻∼∽∾≀≁≂≃≄≅≆≇≈≉≊≋≌≍≎≏≐≑≒≓≔≕≖≗≘≙≚≛≜≝≞≟"
+    "≠≡≤≥≦≧≨≩≪≫≬≭≮≯≰≱≲≳≴≵≶≷≸≹≺≻≼≽≾≿"
+    "⊂⊃⊄⊅⊆⊇⊈⊉⊊⊋⊕⊖⊗⊘⊙⊚⊛⊝⊞⊟⊠⊡⊢⊣⊤⊥⊦⊧⊨⊩⊪⊫⊬⊭⊮⊯"
+    "⊰⊱⊲⊳⊴⊵⊶⊷⊸⊹⊺⊻⊼⊽⊾⊿⋀⋁⋂⋃⋄⋅⋆⋇⋈⋉⋊⋋⋌⋍⋎⋏⋐⋑⋒⋓⋔⋕⋖⋗⋘⋙⋚⋛⋜⋝⋞⋟⋠⋡⋢⋣⋤⋥⋦⋧⋨⋩⋪⋫⋬⋭⋮⋯⋰⋱⋲⋳⋴⋵⋶⋷⋸⋹⋺⋻⋼⋽⋾⋿"
+    "⌀⌁⌂⌃⌄⌅⌆⌇⌈⌉⌊⌋⌌⌍⌎⌏⌐⌑⌒⌓⌔⌕⌖⌗⌘⌙⌚⌛⌜⌝⌞⌟"
+    "⎛⎜⎝⎞⎟⎠⎡⎢⎣⎤⎥⎦⎧⎨⎩⎪⎫⎬⎭⎮⎯⎰⎱⎲⎳⎴⎵⎶⎷⎸⎹⎺⎻⎼⎽⎾⎿"
+    "ⓐⓑⓒⓓⓔⓕⓖⓗⓘⓙⓚⓛⓜⓝⓞⓟⓠⓡⓢⓣⓤⓥⓦⓧⓨⓩ"
+    "ⒶⒷⒸⒹⒺⒻⒼⒽⒾⒿⓀⓁⓂⓃⓄⓅⓆⓇⓈⓉⓊⓋⓌⓍⓎⓏ"
+    "⟦⟧⟨⟩⟪⟫⟬⟭⟮⟯⟰⟱⟲⟳⟴⟵⟶⟷⟸⟹⟺⟻⟼⟽⟾⟿"
+    "⧀⧁⧂⧃⧄⧅⧆⧇⧈⧉⧊⧋⧌⧍⧎⧏"
+    "⨀⨁⨂⨃⨄⨅⨆⨇⨈⨉⨊⨋⨌⨍⨎⨏⨐⨑⨒⨓⨔⨕⨖⨗"
+    "⩀⩁⩂⩃⩄⩅⩆⩇⩈⩉⩊⩋⩌⩍⩎⩏⩐⩑⩒⩓⩔⩕⩖⩗"
+    "←↑→↓↔↕↖↗↘↙"
+    "αβγδεζηθικλμνξοπρστυφχψω"
+    "ΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΣΤΥΦΧΨΩ"
+)
+SPECIAL_SET = set(special_chars)
 
-def last_boxed_only_string(string: str) -> Optional[str]:
-    """Extract the last LaTeX boxed expression from a string.
-
-    Args:
-        string: Input string containing LaTeX code
-
-    Returns:
-        The last boxed expression or None if not found
+# ====== 分类统计 ======
+def count_char_categories(text: str) -> Dict[str, int]:
     """
-    idx = string.rfind("\\boxed{")
+    统计英语、数字、符号、其它四类字符数量（空白不计入 total）。
+    """
+    eng = num = sym = other = 0
+    for ch in text:
+        if ch.isspace():                     # 空白字符直接跳过
+            continue
+        if 'A' <= ch <= 'Z' or 'a' <= ch <= 'z':
+            eng += 1
+        elif ch.isdigit():
+            num += 1
+        elif (
+            unicodedata.category(ch)[0] in {"S", "P"}
+            or ch in SPECIAL_SET
+        ):
+            sym += 1
+        else:
+            other += 1
+    total = eng + num + sym + other
+    return {"english": eng, "number": num, "symbol": sym, "other": other, "total": total}
+
+def reward_ratio(text: str) -> float:  ## reward_ratio(s)
+    """(英字 + 数字 + 符号) / total"""
+    c = count_char_categories(text)
+    if c["total"] == 0:
+        return 0.0
+    return (c["english"] + c["number"] + c["symbol"]) / c["total"]
+
+
+
+def last_boxed_only_string(string):
+    idx = string.rfind("\\boxed")
     if idx < 0:
-        return None
+        idx = string.rfind("\\fbox")
+        if idx < 0:
+            return None
 
     i = idx
     right_brace_idx = None
     num_left_braces_open = 0
-
     while i < len(string):
         if string[i] == "{":
             num_left_braces_open += 1
@@ -43,23 +95,35 @@ def last_boxed_only_string(string: str) -> Optional[str]:
                 right_brace_idx = i
                 break
         i += 1
+    
+    if right_brace_idx == None:
+        retval = None
+    else:
+        retval = string[idx:right_brace_idx + 1]
+    
+    return retval
 
-    return string[idx : right_brace_idx + 1] if right_brace_idx is not None else None
-
-
-def remove_boxed(s: str) -> str:
-    """Remove the LaTeX boxed command from a string.
-
-    Args:
-        s: String with format "\\boxed{content}"
-
-    Returns:
-        The content inside the boxed command
-    """
+def remove_boxed(s):
     left = "\\boxed{"
-    assert s[: len(left)] == left, f"box error: {s}"
-    assert s[-1] == "}", f"box error: {s}"
-    return s[len(left) : -1]
+    try:
+        assert s[:len(left)] == left
+        assert s[-1] == "}"
+        return s[len(left):-1]
+    except:
+        return None
+
+
+
+def extract_boxed_answer(solution: str) -> str:
+    """Extract the answer from inside a LaTeX \\boxed{} command"""
+    solution = last_boxed_only_string(solution)
+    solution = remove_boxed(solution)
+    return solution
+
+def extract_answer(passage: str) -> str:
+    if "\\boxed" in passage:
+        return extract_boxed_answer(passage)
+    return None
 
 
 
@@ -176,8 +240,9 @@ def is_correct_minerva(solution_str: str, gt: str, gt_need_extract: bool = False
         Tuple of (is_correct, normalized_prediction)
     """
     # Extract answer from solution
-    match = re.findall(answer_pattern, solution_str)
-    extracted_answer = match[-1] if match else "[INVALID]"
+    # match = re.findall(answer_pattern, solution_str)
+    match = extract_answer(solution_str)
+    extracted_answer = match if match else "[INVALID]"
     pred = normalize_final_answer(extracted_answer)
 
     # Process ground truth
@@ -252,12 +317,15 @@ def compute_score(
         Reward score (1.0 for correct, -1.0 for incorrect)
     """
     # Limit solution length for efficiency
-    solution_str = solution_str[-300:]  # The longest answer in MATH-500 has 159 characters
+    # solution_str = solution_str[-300:]  # The longest answer in MATH-500 has 159 characters
 
     # Verify the solution
     correct, pred = verify(solution_str, ground_truth, strict_box_verify, pause_tokens_index)
+    # reward = 1.0 if correct else -1.0
 
-    reward = 1.0 if correct else -1.0
+    language_score = reward_ratio(solution_str)  # range(0,1)
+    reward = 1.0 if correct else -2.0 + language_score
+
     acc = correct
 
     return {

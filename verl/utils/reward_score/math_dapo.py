@@ -324,7 +324,7 @@ def compute_score(
     # reward = 1.0 if correct else -1.0
 
     language_score = reward_ratio(solution_str)  # range(0,1)
-    reward = 1.0 if correct else -2.0 + language_score
+    reward = 1.0 if correct else -1.0
 
     acc = correct
 

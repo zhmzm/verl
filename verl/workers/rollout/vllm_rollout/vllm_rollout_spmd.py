@@ -456,6 +456,7 @@ class vLLMRollout(BaseRollout):
                 "top_p"      : self.config.val_kwargs.top_p,
                 "temperature": self.config.val_kwargs.temperature,
                 "n"          : 1,
+                "logprobs": 1,
             }
             with self.update_sampling_params(**val_kw):
                 outs = self.inference_engine.generate(vllm_inputs, self.sampling_params, use_tqdm=False)
@@ -495,8 +496,8 @@ class vLLMRollout(BaseRollout):
                         temps_used.append(temps)     
 
             unique_temps_no_none = set(t for seq in temps_used for t in seq if t is not None)
-            print(f"不同温度（不含 None）数: {len(unique_temps_no_none)}")
-            print("所有不同温度（不含 None）:", unique_temps_no_none)             
+            print(f"vllm_rollout_spmd: 不同温度（不含 None）数: {len(unique_temps_no_none)}")
+            print("vllm_rollout_spmd: 所有不同温度（不含 None）:", unique_temps_no_none)             
 
             # 现在 outputs_token_ids 顺序为：prompt0_T0, prompt1_T0 … prompt{bs-1}_T0, prompt0_T1 …
             # 需要转成 prompt 主序 + temp 次序
@@ -518,11 +519,14 @@ class vLLMRollout(BaseRollout):
             max_length=self.config.response_length,
         ).to(idx.device)                                   # (bs*n, resp_len)
 
-        token_level_temperature = pad_2d_list_to_length(
-            temps_used,
-            -1.0,                           # sentinel
-            max_length=self.config.response_length,
-        ).to(idx.device)                            # (bs*effective_n, resp_len)
+        if is_validate:
+            token_level_temperature = response # validate dont recompute log_probs, put response here to pass check
+        else:
+            token_level_temperature = pad_2d_list_to_length(
+                temps_used,
+                self.sampling_params.temperature,                           # sentinel
+                max_length=self.config.response_length,
+            ).to(idx.device) # (bs*effective_n, resp_len)
 
         effective_n = response.size(0) // bs
         if effective_n > 1:

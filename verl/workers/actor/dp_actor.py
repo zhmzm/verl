@@ -156,8 +156,16 @@ class DataParallelPPOActor(BasePPOActor):
                         fill_value=temperature,  # 要填入的值
                         dtype=logits_rmpad.dtype,
                         device=logits_rmpad.device,
-                    )
+                    ) 
+                    unique_temps_no_none = set(t.item() for seq in micro_batch["token_temperature"] for t in seq if t is not None)
+                    print('temperature: temperature')
+
+                    print(f"dp_actor.py: micro_batch['token_temperature']不同温度（不含 None）数: {len(unique_temps_no_none)}")
+                    print("dp_actor.py: micro_batch['token_temperature']所有不同温度（不含 None）:", unique_temps_no_none)  
                     token_temperature_full[:, -resp_len:] = micro_batch["token_temperature"].to(logits_rmpad.dtype)
+                    unique_temps_no_none = set(t.item() for seq in token_temperature_full for t in seq if t is not None)
+                    print(f"dp_actor.py: 不同温度（不含 None）数: {len(unique_temps_no_none)}")
+                    print("dp_actor.py: 所有不同温度（不含 None）:", unique_temps_no_none)  
 
                     # --------------- 压平并对齐到 rmpad 顺序 ---------------
                     token_temperature_rmpad = index_first_axis(

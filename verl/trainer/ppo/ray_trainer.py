@@ -961,6 +961,13 @@ class RayPPOTrainer:
         )
 
         self.global_steps = 0
+        self._temp_start = 1.2
+        self._temp_end   = 1.4
+        self._warmup_steps = 300   # 0‑based；第 300 步之后恒为 _temp_end
+
+        def _get_curr_temperature(self) -> float:
+            prog = min(self.global_steps, self._warmup_steps) / self._warmup_steps
+            return self._temp_start + prog * (self._temp_end - self._temp_start)
 
         # load checkpoint before doing anything
         self._load_checkpoint()
@@ -987,6 +994,8 @@ class RayPPOTrainer:
                 metrics = {}
                 timing_raw = {}
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
+                curr_T = self._get_curr_temperature()
+                batch.meta_info["temperature"] = curr_T
 
                 # pop those keys for generation
                 batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]

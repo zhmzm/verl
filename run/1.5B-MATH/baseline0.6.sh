@@ -44,7 +44,7 @@ TEST_FILE=${TEST_FILE:-"/opt/tiger/verl/data/dapo-box/aime-2024-box.parquet"}
 temperature=0.6
 top_p=1.0
 top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
-val_top_p=0.7
+val_top_p=0.95
 
 # Performance Related Parameter
 sp_size=4
@@ -101,7 +101,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.temperature=${temperature} \
     actor_rollout_ref.rollout.top_p=${top_p} \
     actor_rollout_ref.rollout.top_k=${top_k} \
-    actor_rollout_ref.rollout.val_kwargs.temperature=${temperature} \
+    actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
     actor_rollout_ref.rollout.val_kwargs.top_p=${val_top_p} \
     actor_rollout_ref.rollout.val_kwargs.top_k=${top_k} \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \

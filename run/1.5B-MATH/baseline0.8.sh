@@ -2,7 +2,7 @@
 set -xeuo pipefail
 
 project_name='DAPO-qwen1.5B-MATH'
-exp_name='baseline1.0'
+exp_name='baseline0.8'
 
 adv_estimator=grpo
 
@@ -37,11 +37,11 @@ RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
 # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
 MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen2.5-Math-1.5B"}
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
-TRAIN_FILE=${TRAIN_FILE:-"/opt/tiger/verl/data/dapo-box/dapo-math-17k.parquet"}
-TEST_FILE=${TEST_FILE:-"/opt/tiger/verl/data/dapo-box/aime-2024.parquet"}
+TRAIN_FILE=${TRAIN_FILE:-"/opt/tiger/verl/data/dapo-box/dapo-math-17k-box.parquet"}
+TEST_FILE=${TEST_FILE:-"/opt/tiger/verl/data/dapo-box/aime-2024-box.parquet"}
 
 # Algorithm
-temperature=1.0
+temperature=0.8
 top_p=1.0
 top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 val_top_p=0.7

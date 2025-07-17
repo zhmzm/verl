@@ -24,7 +24,7 @@ loss_agg_mode="token-mean"
 
 train_prompt_bsz=512
 n_resp_per_prompt=8
-train_prompt_mini_bsz=64
+train_prompt_mini_bsz=128
 
 # Ray
 # RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -47,12 +47,12 @@ top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 val_top_p=0.95
 
 # Performance Related Parameter
-sp_size=4
+sp_size=1
 use_dynamic_bsz=True
 actor_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 2))
 infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 3))
 offload=True
-gen_tp=4
+gen_tp=1
 fsdp_size=32
 
 # reference run wandb: https://wandb.ai/verl-org/DAPO%20Reproduction%20on%20verl/runs/ow47vvon?nw=nwusertongyuxuan361

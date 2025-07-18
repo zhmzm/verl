@@ -35,7 +35,7 @@ NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 # Paths
 RAY_DATA_HOME=${RAY_DATA_HOME:-"/mnt/bn/llm-liufangxu/mlx/users/haomin/verl/save/"}
 # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
-MODEL_PATH=${MODEL_PATH:-"deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"}
+MODEL_PATH=${MODEL_PATH:-"/mnt/bn/llm-liufangxu/mlx/users/haomin/model/DeepSeek-R1-Distill-Qwen-1.5B"}
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 TRAIN_FILE=${TRAIN_FILE:-"/opt/tiger/verl/data/dapo-box/dapo-math-17k-box.parquet"}
 TEST_FILE=${TEST_FILE:-"/opt/tiger/verl/data/dapo-box/aime-2024-box.parquet"}

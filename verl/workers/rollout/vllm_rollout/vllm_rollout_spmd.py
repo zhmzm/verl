@@ -170,7 +170,7 @@ class vLLMRollout(BaseRollout):
 
         kwargs = dict(
             n=1,
-            logprobs=0,  # can be set to 0 and let actor to recompute
+            logprobs=1,  # can be set to 0 and let actor to recompute
             max_tokens=config.response_length,
         )
 
@@ -459,55 +459,97 @@ class vLLMRollout(BaseRollout):
                 "logprobs": 1,
             }
             with self.update_sampling_params(**val_kw):
+                print('test gen:', self.sampling_params)
                 outs = self.inference_engine.generate(vllm_inputs, self.sampling_params, use_tqdm=False)
             for o in outs:
                 outputs_token_ids.append(o.outputs[0].token_ids)
                 temps_used.append(val_kw["temperature"])   # ← 记录温度
 
-        # ------ (C) Training / Sampling ⇒ 多温度，多次调用 ---------------
+        # ------ (C) Training / Sampling ⇒ 多 prompt × 多 temperature，一次调用 ---------------
         else:
-            orig_n = self.sampling_params.n           # 目标采样条数
-            base_T = kwargs.get("temperature", self.sampling_params.temperature)
+            import uuid
 
-            # 构造对称偏移序列：0, −0.1, +0.1, −0.2, +0.2, −0.3 …
-            deltas, step = [0.0, -0.1, 0.1, -0.2, 0.2], 0.3
+            bs       = len(vllm_inputs)          # prompt 数
+            orig_n   = self.sampling_params.n    # 目标采样条数 (= 温度数)
+            base_T   = kwargs.get("temperature", self.sampling_params.temperature)
+
+            # ① 构造对称偏移温度序列
+            deltas, step = [0.0, 0.0, -0.1, 0.1, -0.2, 0.2], 0.3
             while len(deltas) < orig_n:
                 deltas.extend([-step, step])
                 step += 0.1
             temp_list = [max(0.0, base_T + d) for d in deltas[:orig_n]]
 
-            for T in temp_list:
-                per_kw = {"temperature": T, "n": 1, "logprobs": 1}
-                with self.update_sampling_params(**per_kw):
-                    outs = self.inference_engine.generate(vllm_inputs, self.sampling_params, use_tqdm=False)
-                for output in outs:                       # 一条 prompt 的结果
-                    for sample in output.outputs:         # n 条 sample；你的例子里 n==1
-                        # 1) token_ids
-                        outputs_token_ids.append(sample.token_ids)
-                        # 2) 温度序列 —— 存在 sentinel token_id == -1 的那一列
-                        step_dicts = getattr(sample, "top_logprobs", None)
-                        if step_dicts is None:            # vLLM ≥0.6 改名为 token_logprobs
-                            step_dicts = sample.logprobs
-                        temps = []
-                        for step in step_dicts:           # step 是 dict{token_id: Logprob}
-                            sent = step.get(-1)           # 我们写入的温度列
-                            temps.append(float(sent.logprob) if sent else None)
+            # ② 准备 batched_reqs & batched_params（外层 temp，内层 prompt → temp‑major 顺序）
+            batched_reqs, batched_params = [], []
+            base_sp = deepcopy(self.sampling_params)
+            base_sp.n = 1                       # 每个组合各出 1 条 sample
+            base_sp.logprobs = 1
 
-                        temps_used.append(temps)     
+            for T in temp_list:                 # temp-major 顺序保证与旧代码一致
+                for req in vllm_inputs:         # 遍历 prompt
+                    new_req = deepcopy(req)     # 深拷贝防止引用冲突
+                    # 若是 GenerateRequest/PromptTokens，需要改 request_id
+                    if hasattr(new_req, "request_id"):
+                        new_req.request_id = f"{new_req.request_id}_{uuid.uuid4().hex[:8]}"
+                    batched_reqs.append(new_req)
 
-            unique_temps_no_none = set(t for seq in temps_used for t in seq if t is not None)
-            print(f"vllm_rollout_spmd: 不同温度（不含 None）数: {len(unique_temps_no_none)}")
-            print("vllm_rollout_spmd: 所有不同温度（不含 None）:", unique_temps_no_none)             
+                    sp = deepcopy(base_sp)
+                    sp.temperature = T
+                    batched_params.append(sp)
 
-            # 现在 outputs_token_ids 顺序为：prompt0_T0, prompt1_T0 … prompt{bs-1}_T0, prompt0_T1 …
-            # 需要转成 prompt 主序 + temp 次序
-            reordered, reordered_tmp = [], []
-            for i in range(bs):
-                for j in range(orig_n):
-                    reordered.append(outputs_token_ids[j*bs + i])
-                    reordered_tmp.append(temps_used       [j*bs + i])
-            outputs_token_ids = reordered
+            # ③ 一次性 generate
+            outs = self.inference_engine.generate(
+                batched_reqs,
+                batched_params,
+                use_tqdm=False,
+            )
+
+            # ④ 解析输出、统计温度列命中
+            outputs_token_ids, temps_used = [], []
+            correct_counter, false_counter = 0, 0
+
+            for output in outs:                 # 与 batched_reqs 位置一一对应
+                for sample in output.outputs:   # n == 1
+                    # (1) token_ids
+                    outputs_token_ids.append(sample.token_ids)
+
+                    # (2) 解析我们写入 sentinel token_id == -1 的温度
+                    step_dicts = getattr(sample, "top_logprobs", None)
+                    if step_dicts is None:      # vLLM≥0.6 改名 token_logprobs
+                        step_dicts = sample.logprobs
+
+                    temps = []
+                    for step in step_dicts:     # step : dict{token_id: Logprob}
+                        sent = step.get(-1)
+                        if sent is not None:
+                            correct_counter += 1
+                            temps.append(float(sent.logprob))
+                        else:
+                            false_counter += 1
+                            temps.append(base_T) # fall‑back
+                    temps_used.append(temps)
+
+            # ⑤ 可选日志
+            # print("sentinel 命中 / miss:", correct_counter, false_counter)
+
+            # ⑥ 重排为 prompt‑major 顺序：prompt0_T0, prompt0_T1, … prompt0_T{n-1}, prompt1_T0 …
+            reordered_tok, reordered_tmp = [], []
+            for i in range(bs):                 # prompt idx
+                for j in range(orig_n):         # temp idx
+                    index = j * bs + i            # 当前位置在 temp‑major 列表里的索引
+                    reordered_tok.append(outputs_token_ids[index])
+                    reordered_tmp.append(temps_used[index])
+
+            outputs_token_ids = reordered_tok
             temps_used        = reordered_tmp
+
+            # ⑦ 统计不同温度（排除 None）
+            unique_temps_no_none = {t for seq in temps_used for t in seq if t is not None}
+            # print(f"不同温度数: {len(unique_temps_no_none)} -> {unique_temps_no_none}")
+
+            # 后续代码可直接使用重排后的 outputs_token_ids, temps_used
+
 
 
         # ------------------------------------------------------------------

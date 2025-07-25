@@ -85,17 +85,29 @@ class RayDAPOTrainer(RayPPOTrainer):
         batch = None
         num_prompt_in_batch = 0
         num_gen_batches = 0
+        # 读取初始温度（假设在 config 里）
+        self.curr_temperature = self.config.actor_rollout_ref.rollout.temperature
+        temperature_step = 0.1          # 每次增加多少
+        schedule_interval = 50          # 每多少个 epoch 调一次
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
+                # ---------- 温度调度 begin ----------
+                if self.global_steps % schedule_interval == 0:
+                    self.curr_temperature += temperature_step
+                    self.config.actor_rollout_ref.rollout.temperature = self.curr_temperature
+                    print(   # 注意这里用上面创建的 logger，而不是 self.logger
+                        f"[TempScheduler] Step {self.global_steps}: temperature set to {self.curr_temperature}"
+                    )
+                # ---------- 温度调度  end  -----------
                 metrics = {}
 
                 new_batch: DataProto = DataProto.from_single_dict(batch_dict)
                 num_gen_batches += 1
                 # pop those keys for generation
-                if "multi_modal_data" in new_batch.non_tensor_batch.keys():
+                if "multi_modal_inputs" in new_batch.non_tensor_batch.keys():
                     gen_batch = new_batch.pop(
                         batch_keys=["input_ids", "attention_mask", "position_ids"],
-                        non_tensor_batch_keys=["raw_prompt_ids", "multi_modal_data"],
+                        non_tensor_batch_keys=["raw_prompt_ids", "multi_modal_data", "multi_modal_inputs"],
                     )
                 else:
                     gen_batch = new_batch.pop(
@@ -108,6 +120,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                 with _timer("step", timing_raw):
                     # generate a batch
                     with _timer("gen", timing_raw):
+                        gen_batch.meta_info['temperature']=self.curr_temperature
                         gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
@@ -201,7 +214,6 @@ class RayDAPOTrainer(RayPPOTrainer):
                             max_num_gen_batches = self.config.algorithm.filter_groups.max_num_gen_batches
                             if max_num_gen_batches <= 0 or num_gen_batches < max_num_gen_batches:
                                 print(f"{num_gen_batches=}. Keep generating...")
-                                progress_bar.update(1)
                                 continue
                             else:
                                 raise ValueError(f"{num_gen_batches=} >= {max_num_gen_batches=}." + " Generated too many. Please check if your data are too difficult." + " You could also try set max_num_gen_batches=0 to enable endless trials.")
@@ -214,11 +226,9 @@ class RayDAPOTrainer(RayPPOTrainer):
 
                     batch.batch["response_mask"] = compute_response_mask(batch)
 
-                    # Balance the number of valid tokens across DP ranks.
-                    # NOTE: This usually changes the order of data in the `batch`,
-                    # which won't affect the advantage calculation (since it's based on uid),
-                    # but might affect the loss calculation (due to the change of mini-batching).
-                    # TODO: Decouple the DP balancing and mini-batching.
+                    # balance the number of valid tokens on each dp rank.
+                    # Note that this breaks the order of data inside the batch.
+                    # Please take care when you implement group based adv computation such as GRPO and rloo
                     if self.config.trainer.balance_batch:
                         self._balance_batch(batch, metrics=metrics)
 

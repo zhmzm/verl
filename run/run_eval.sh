@@ -54,15 +54,16 @@ for val in "${sweep[@]}"; do
   tmp_sh=$(mktemp --suffix=.sh)
 
   # 2) 复制并 patch 启动脚本
-  sed -e "s|^\s*project_name=.*|project_name='${full_proj}' \\\\|" \
-      -e "s|^\s*exp_name=.*|exp_name='${exp_tag}' \\\\|"           \
-      -e "s|^\s*TEST_FILE=.*|TEST_FILE=\${RAY_DATA_HOME}/eval-box-aime256-amc32.parquet \\\\|" \
-      -e "s|^\s*trainer\.save_freq=.*|trainer.save_freq=99999 \\\\|" \
-      -e "s|^\s*trainer\.total_training_steps=.*|trainer.total_training_steps=99999 \\\\|" \
-      -e "s|^\s*trainer\.total_epochs=.*|trainer.total_epochs=99999 \\\\|" \
-      -e "s|^\s*trainer\.log_val_generations=.*|trainer.log_val_generations=1000 \\\\|" \
-      -e "s|^\s*trainer\.val_before_train=.*|trainer.val_before_train=True \\\\|" \
-      "$orig_launch" > "$tmp_sh"
+  sed -e "s|^\s*TEST_FILE=.*|TEST_FILE=\${RAY_DATA_HOME}/eval-box-aime256-amc32.parquet \\\\|" \
+    -e "s|^\s*trainer\.save_freq=.*|trainer.save_freq=99999 \\\\|" \
+    -e "s|^\s*trainer\.total_training_steps=.*|trainer.total_training_steps=99999 \\\\|" \
+    -e "s|^\s*trainer\.total_epochs=.*|trainer.total_epochs=99999 \\\\|" \
+    -e "s|^\s*trainer\.log_val_generations=.*|trainer.log_val_generations=1000 \\\\|" \
+    -e "s|^\s*trainer\.val_before_train=.*|trainer.val_before_train=True \\\\|" \
+    -e "s|^\s*trainer\.project_name=.*|trainer.project_name=\"${full_proj}\" \\\\|" \
+    -e "s|^\s*trainer\.experiment_name=.*|trainer.experiment_name=\"${exp_tag}\" \\\\|" \
+    -e "s|^\s*actor_rollout_ref\.rollout\.val_kwargs\.temperature=.*|actor_rollout_ref.rollout.val_kwargs.temperature=\${TEMPERATURE} \\\\|" \
+    "$orig_launch" > "$tmp_sh"
   chmod +x "$tmp_sh"
 
   # 3) 提交 Ray Job，直接从回显抓 job_id

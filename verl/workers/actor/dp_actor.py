@@ -157,15 +157,7 @@ class DataParallelPPOActor(BasePPOActor):
                         dtype=logits_rmpad.dtype,
                         device=logits_rmpad.device,
                     ) 
-                    unique_temps_no_none = set(t.item() for seq in micro_batch["token_temperature"] for t in seq if t is not None)
-                    print('temperature: temperature')
-
-                    print(f"dp_actor.py: micro_batch['token_temperature']不同温度（不含 None）数: {len(unique_temps_no_none)}")
-                    print("dp_actor.py: micro_batch['token_temperature']所有不同温度（不含 None）:", unique_temps_no_none)  
-                    token_temperature_full[:, -resp_len:] = micro_batch["token_temperature"].to(logits_rmpad.dtype)
-                    unique_temps_no_none = set(t.item() for seq in token_temperature_full for t in seq if t is not None)
-                    print(f"dp_actor.py: 不同温度（不含 None）数: {len(unique_temps_no_none)}")
-                    print("dp_actor.py: 所有不同温度（不含 None）:", unique_temps_no_none)  
+                    token_temperature_full[:, -resp_len:] = micro_batch["token_temperature"].to(logits_rmpad.dtype)    
 
                     # --------------- 压平并对齐到 rmpad 顺序 ---------------
                     token_temperature_rmpad = index_first_axis(
@@ -176,23 +168,8 @@ class DataParallelPPOActor(BasePPOActor):
                     # --------------- 逐 token 调温 ---------------
                     token_temperature_rmpad.clamp_(min=1e-4)
                     logits_rmpad.div_(token_temperature_rmpad.unsqueeze(-1))
+                    
 
-                    # ---------------- 调试打印 (仅一次) ----------------
-                    # if True:
-                    #     print("\n====== Token-level Temperature Debug ======")
-                    #     print("input_ids.shape               :", input_ids.shape)              # (bs, seqlen)
-                    #     print("responses.shape               :", micro_batch['responses'].shape)  # (bs, resp_len)
-                    #     print("token_temperature_full.shape  :", token_temperature_full.shape) # (bs, seqlen)
-                    #     print("token_temperature_rmpad.shape :", token_temperature_rmpad.shape) # (total_nnz,)
-                    #     print("logits_rmpad.shape            :", logits_rmpad.shape)           # (total_nnz, vocab)
-                    #     print("indices range                 : 0 …", int(indices.max()), "(seqlen-1 =", seqlen-1, ")")
-                    #     print("sample T prompt - first token :", float(token_temperature_full[0, 0]))
-                    #     print("sample T response - last token:", float(token_temperature_full[0, -1]))
-                    #     print("sample logits after  div      :", logits_rmpad[0, :5].float().cpu())
-                    #     print("==========================================\n")
-
-
-                    # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                     inplace_backward = True
                     if calculate_entropy:
                         inplace_backward = False

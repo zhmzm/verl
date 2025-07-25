@@ -92,12 +92,8 @@ class RayDAPOTrainer(RayPPOTrainer):
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 # ---------- 温度调度 begin ----------
-                if self.global_steps % schedule_interval == 0:
-                    self.curr_temperature += temperature_step
-                    self.config.actor_rollout_ref.rollout.temperature = self.curr_temperature
-                    print(   # 注意这里用上面创建的 logger，而不是 self.logger
-                        f"[TempScheduler] Step {self.global_steps}: temperature set to {self.curr_temperature}"
-                    )
+                self.curr_temperature += 0.7/400
+                print('Using linear increase temperature TEMP:', self.curr_temperature)
                 # ---------- 温度调度  end  -----------
                 metrics = {}
 
